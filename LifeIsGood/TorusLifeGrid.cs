@@ -5,11 +5,12 @@ using System.Linq;
 namespace LifeIsGood
 {
     /// <summary>
-    /// Two-dimensional orthogonal grid with left and right edges, and the top and bottom edges also, stitched together yielding a toroidal array
-    /// Stitching the edges implies that the top and the bottom edges have the same size, and the same applies for left and right edges.
+    /// Two-dimensional grid with the left and right (and the top and bottom) edges stitched together yielding a toroidal array
+    /// Stitching the edges implies that the top and the bottom (left and right) edges have the same size
     /// </summary>
     /// <remarks>
-    /// Using jagged arrays. Jagged arrays are faster and each array of a jagged occupies its block of memory (vs multidimensional array is a single block of memory). 
+    /// Using jagged arrays.
+    /// Jagged arrays are faster and each array of a jagged occupies its block of memory (vs multidimensional array is a single block of memory). 
     /// </remarks>
     public class TorusLifeGrid
     {
@@ -21,17 +22,14 @@ namespace LifeIsGood
                 throw new ArgumentNullException(nameof(grid));
             }
 
-            // Torus is achieved as two-dimensional grid with left and right edges, and the top and bottom edges also, stitched together yielding a toroidal array
-            // Stitching the edges implies that the top and the bottom edges have the same size, and the same applies for left and right edges.
-            // For this reason we will resize all jagged inner arrays to be of max inner array length 
+            // resize all inner jagged arrays to be the same size (if they are not); the size of the max inner array 
             var gridMaxColumns = grid.Select(r => r.Length).Max();
 
             torusGrid = new bool[grid.Length][];
             for (int i = 0; i < grid.Length; i++)
             {
-                var newArray = new bool[gridMaxColumns];
-                grid[i].CopyTo(newArray, 0);
-                torusGrid[i] = newArray;
+                torusGrid[i] = new bool[gridMaxColumns];
+                grid[i].CopyTo(torusGrid[i], 0);
             }
         }
 
@@ -39,12 +37,16 @@ namespace LifeIsGood
 
         /// <summary>
         /// To store new state we could either create identical jagged array, which is memory intensive, 
-        /// or we could store new lines in buffer and update existing jagged array when we do not need the line for next neighbour calculations
-        /// Using buffer technique 
+        /// or we could store new lines in buffer and update existing jagged array when we do not need the line for next neighbours calculations
+        /// line buffer technique is used.
+        /// 
+        /// If we expect life to evolve in parallel then locking or non-blocking synchronisation techniques should be considered. Not supported at the moment
         /// </summary>
         public void Evolve()
         {
             if (torusGrid == null || torusGrid.Length == 0) return;
+
+            var lastCellIndex = torusGrid[0].Length - 1;
 
             bool[] nextStateFirstRow = null;
             bool[] nextStatePreviousLine = null;
@@ -56,17 +58,21 @@ namespace LifeIsGood
 
                 nextStateCurrentLine = new bool[torusGrid[i].Length];
 
-                var neighbourRows = GetNeighbourRows(torusGrid, i).ToArray(); //  Neighbour Rows are Preceding Row, Row at an index and Following Row
-
-                var liveNeighboursCountByColumn = GetLiveNeighboursCountByColumn(neighbourRows).ToArray(); // array with the count of live cells in 3 neighbour Rows by the same cell (column)
+                // array with the count of live cells in corresponding 3 neighbour rows (summed by the same cell/column). 
+                var rowLiveCountByColumn = GetCountOfLiveCellsInNeighbourRowsByColumns(torusGrid, i); 
 
                 for (int j = 0; j < torusGrid[i].Length; j++) // current cell j 
                 {
                     var isLive = torusGrid[i][j];
 
-                    var liveNeighboursCount = CountLiveNeighbours(liveNeighboursCountByColumn, j, isLive);
+                    // if cell index is the first cell then preceding cell is the last cell of the row as we use torus, otherwise just j - 1 
+                    // if cell index is the last cell then following cell is the first cell of the row as we use torus, otherwise just j + 1
+                    var liveNeighboursCount = rowLiveCountByColumn[j == 0 ? lastCellIndex : j - 1] 
+                                              + rowLiveCountByColumn[j] 
+                                              + rowLiveCountByColumn[j == lastCellIndex ? 0 : j + 1] 
+                                              - (isLive ? 1 : 0); // rowLiveCountByColumn include self cell count hence we need to subtract it 
 
-                    nextStateCurrentLine[j] = Evolve(isLive, liveNeighboursCount);
+                    nextStateCurrentLine[j] = EvolveCell(isLive, liveNeighboursCount);
                 }
 
                 // update torusGrid
@@ -75,7 +81,7 @@ namespace LifeIsGood
                     torusGrid[i - 1] = nextStatePreviousLine;
                 }
 
-                if (i == 0) // first row. keep old state until the end as it is required for the last row calc
+                if (i == 0) // first row. keep old state until the end as it is required for the last row calculation
                 {
                     nextStateFirstRow = nextStateCurrentLine;
                     nextStateCurrentLine = null;
@@ -89,68 +95,41 @@ namespace LifeIsGood
         }
 
         /// <summary>
-        /// Any live cell with fewer than two live neighbors dies, as if by underpopulation.
-        /// Any live cell with two or three live neighbors lives on to the next generation.
-        /// Any live cell with more than three live neighbors dies, as if by overpopulation.
-        /// Any dead cell with exactly three live neighbours becomes a live cell, as if by reproduction.
-        /// </summary>
-        /// <param name="cellValue"></param>
-        /// <param name="liveNeighboursCount"></param>
-        /// <returns></returns>
-        private bool Evolve(bool liveCell, int liveNeighboursCount)
+        /// We get neighbour rows - it is an array of 3 arrays , of 3 rows
+        /// If we count live sells in columns ( e.i. in each of 3 arrays at the same cell) we will have summary of "column" neighbour live count
+        /// e.g.
+        /// NeighbourRows:
+        ///     --**--
+        ///     -**---
+        ///     --**-*
+        /// Will result in array:
+        ///     013201
+        ///  </summary>
+        /// <param name="torusGrid"></param>
+        /// <param name="rowIndex"></param>
+        /// <returns>array of int containing count of live cells in columns(same cell index) across three arrays </returns>
+        private static int[] GetCountOfLiveCellsInNeighbourRowsByColumns(bool[][] torusGrid, int rowIndex)
         {
-            //These rules can be condensed into the following:
+            var neighbourRows = GetNeighbourRows(torusGrid, rowIndex).ToArray();
 
-            //  Any live cell with two or three neighbors survives.
-            if (liveCell && liveNeighboursCount == 2 || liveNeighboursCount == 3) return true;
-
-            //  Any dead cell with three live neighbors becomes a live cell.
-            if (!liveCell && liveNeighboursCount == 3) return true;
-
-            //  All other live cells die in the next generation.Similarly, all other dead cells stay dead.
-            return false;
-        }
-
-        private static int CountLiveNeighbours(int[] liveNeighboursCountByColumn, int cellndex, bool cellValue)
-        {
-            var lastCellIndex = liveNeighboursCountByColumn.Length - 1;
-
-            // if cell index is the first cell then preceding cell is the last cell of the row as we use torus, otherwise just cellndex - 1 
-            var precedingCellIndex = cellndex == 0 ? lastCellIndex : cellndex - 1;
-
-            // if cell index is the last cell then following cell is the first cell of the row as we use torus, otherwise just cellndex + 1
-            var followingCellIndex = cellndex == lastCellIndex ? 0 : cellndex + 1;
-
-            return liveNeighboursCountByColumn[precedingCellIndex] +
-                liveNeighboursCountByColumn[cellndex] +
-                liveNeighboursCountByColumn[followingCellIndex]
-                - (cellValue ? 1 : 0);
-        }
-
-        /// <summary>
-        /// we build neighbourRows as 3 arrays of the same legth 
-        /// if we add up all live cells in each column ( for each cell index j ) we will have summary array of live neighbours + self 
-        /// </summary>
-        /// <param name="neighbourRows"></param>
-        /// <returns></returns>
-        private static IEnumerable<int> GetLiveNeighboursCountByColumn(bool[][] neighbourRows)
-        {
-            int[] liveNeighboursCount = new int[neighbourRows[0].Length];
+            int[] liveNeighboursCountPerColumn  = new int[neighbourRows[0].Length];
 
             for (int j = 0; j < neighbourRows[0].Length; j++) // current cell j 
             {
+                // sum live cell at the same position  across the rows 
                 int liveCount = 0;
                 if (neighbourRows[0][j]) liveCount++;
                 if (neighbourRows[1][j]) liveCount++;
                 if (neighbourRows[2][j]) liveCount++;
-                liveNeighboursCount[j] = liveCount;
+                liveNeighboursCountPerColumn[j] = liveCount;
             }
 
-            return liveNeighboursCount;
+            return liveNeighboursCountPerColumn;
         }
 
         /// <summary>
         /// Neighbour Rows are Preceding Row, Row at an index and the Following Row
+        /// As we have torus the first row has a last as preceding and the laset row has a first as following
         /// </summary>
         /// <param name="torusGrid"></param>
         /// <param name="rowIndex"></param>
@@ -181,6 +160,29 @@ namespace LifeIsGood
             yield return torusGrid[precedingRowIndex];
             yield return torusGrid[rowIndex];
             yield return torusGrid[followingRowIndex];
+        }
+
+        /// <summary>
+        /// Any live cell with fewer than two live neighbors dies, as if by underpopulation.
+        /// Any live cell with two or three live neighbors lives on to the next generation.
+        /// Any live cell with more than three live neighbors dies, as if by overpopulation.
+        /// Any dead cell with exactly three live neighbours becomes a live cell, as if by reproduction.
+        /// </summary>
+        /// <param name="cellValue"></param>
+        /// <param name="liveNeighboursCount"></param>
+        /// <returns></returns>
+        private bool EvolveCell(bool liveCell, int liveNeighboursCount)
+        {
+            //These rules can be condensed into the following:
+
+            //  Any live cell with two or three neighbors survives.
+            if (liveCell && liveNeighboursCount == 2 || liveNeighboursCount == 3) return true;
+
+            //  Any dead cell with three live neighbors becomes a live cell.
+            if (!liveCell && liveNeighboursCount == 3) return true;
+
+            //  All other live cells die in the next generation.Similarly, all other dead cells stay dead.
+            return false;
         }
     }
 }
